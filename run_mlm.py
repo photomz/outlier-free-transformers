@@ -12,6 +12,7 @@ from collections import OrderedDict
 from itertools import chain
 from pathlib import Path
 
+import colored_traceback.auto # MZ: make error tracebacks colorful
 import datasets
 import torch
 import transformers
@@ -73,10 +74,19 @@ def main():
     if args.with_tracking:
         accelerator_log_kwargs["log_with"] = args.report_to
         accelerator_log_kwargs["project_dir"] = args.output_dir
-        accelerator_log_kwargs["run_name"] = args.config_name + datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+        
         # MZ: Support WandB logging
-        os.environ['WANDB_PROJECT'] = args.project_name
-        os.environ['WANDB_LOG_MODEL'] = 'checkpoint' # log all model checkpoints as WandB artifacts
+        if args.report_to == 'wandb':
+            import wandb
+            wandb_run_name = args.run_name + '-' + datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+            wandb.init(
+                project=args.project_name,
+                name=wandb_run_name,
+                resume=args.resume_from_checkpoint,
+                allow_val_change=True
+            )
+            os.environ['WANDB_LOG_MODEL'] = 'checkpoint' # upload model artifacts
+
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps, **accelerator_log_kwargs
@@ -126,6 +136,7 @@ def main():
             config_changes = yaml.safe_load(f)
 
         for key, value in config_changes.items():
+            accelerator.print(f"config: {key}={value}")
             setattr(config, key, value)
 
     # Set dropout rates, if specified
@@ -180,7 +191,6 @@ def main():
             config,
             softmax_fn=SOFTMAX_MAPPING[args.attn_softmax],
             alpha=args.alpha,
-            max_seq_length=args.max_seq_length,
             skip_attn=args.skip_attn,
             attn_gate_type=AttentionGateType[args.attn_gate_type],
             attn_gate_init=args.attn_gate_init,
@@ -222,12 +232,20 @@ def main():
         f"\t= Total (pre-training):\t{n_embeddings + n_encoder + n_head}\n"
         f"\t= Total (encoder):\t{n_embeddings + n_encoder}\n"
     )
+    
+    tokens_per_iter = (
+        args.gradient_accumulation_steps * accelerator.state.num_processes * config.per_device_train_batch_size * config.max_seq_length
+    )
+    accelerator.print(f"tokens per iteration will be: {tokens_per_iter:,}")
+    accelerator.print(
+        f"breaks down as: {args.gradient_accumulation_steps} grad accum steps * {accelerator.state.num_processes} processes * {config.per_device_train_batch_size} batch size * {config.max_seq_length} max seq len"
+    )
 
     # Get the datasets.
     # In distributed training, the load_dataset function guarantee that only one local process can
     # concurrently download the dataset.
     tokenized_book_wiki_path = (
-        Path(args.data_cache_dir) / f"tokenized_book_wiki_{args.max_seq_length}"
+        Path(args.data_cache_dir) / f"tokenized_book_wiki_{config.max_seq_length}"
     )
     if dataset_setup == DatasetSetups.bookcorpus_and_wiki and tokenized_book_wiki_path.exists():
         accelerator.print(f"Loading tokenized dataset from {str(tokenized_book_wiki_path)}")
@@ -292,7 +310,7 @@ def main():
         # Preprocessing the datasets.
 
         # Check sequence length
-        if args.max_seq_length is None:
+        if config.max_seq_length is None:
             max_seq_length = tokenizer.model_max_length
             if max_seq_length > 1024:
                 logger.warning(
@@ -302,13 +320,13 @@ def main():
                 )
                 max_seq_length = 1024
         else:
-            if args.max_seq_length > tokenizer.model_max_length:
+            if config.max_seq_length > tokenizer.model_max_length:
                 logger.warning(
-                    f"The max_seq_length passed ({args.max_seq_length}) is larger than the maximum "
+                    f"The max_seq_length passed ({config.max_seq_length}) is larger than the maximum "
                     f"length for the model ({tokenizer.model_max_length}). Using "
                     f"max_seq_length={tokenizer.model_max_length}."
                 )
-            max_seq_length = min(args.max_seq_length, tokenizer.model_max_length)
+            max_seq_length = min(config.max_seq_length, tokenizer.model_max_length)
 
         # Tokenize all the texts.
         # YB: removed line-by-line option as we'll likely never use it
@@ -369,6 +387,30 @@ def main():
                 load_from_cache_file=not args.overwrite_cache,
                 desc=f"Grouping texts in chunks of {max_seq_length}",
             )
+            
+            
+        def count_tokens(batch):
+            return {'sum': [len(ids) for ids in batch]}
+        
+        # We can use .map to .reduce: https://github.com/huggingface/datasets/pull/5533#issuecomment-1440571658
+        
+        with accelerator.main_process_first():
+            token_dataset_dict = tokenized_datasets.map(
+                count_tokens,
+                input_columns=['input_ids'],
+                batched=True,
+                num_proc=args.preprocessing_num_workers,
+                keep_in_memory=True,
+                remove_columns=tokenized_datasets['validation'].column_names,
+                desc=f'Count tokens'
+            )
+            
+            token_sum = sum(sum(token_dataset_dict[key]['sum']) for key in token_dataset_dict)
+            accelerator.print(f"Total tokens: {token_sum}")
+        
+        if dataset_setup == DatasetSetups.bookcorpus_and_wiki:
+            # Save the tokenizer's hard work
+            tokenized_datasets.save_to_disk(str(tokenized_book_wiki_path))
 
         # <end elif: do tokenization>
 
@@ -385,7 +427,7 @@ def main():
     if len(train_dataset) > 3:
         # Log a few random samples from the training set:
         for index in random.sample(range(len(train_dataset)), 3):
-            logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
+            logger.info(f"Sample {index} of the training set: {train_dataset[index]['input_ids'][:100]} ... ")
 
     # Data collator
     # This one will take care of randomly masking the tokens.
@@ -398,13 +440,13 @@ def main():
         train_dataset,
         shuffle=True,
         collate_fn=data_collator,
-        batch_size=args.per_device_train_batch_size,
+        batch_size=config.per_device_train_batch_size,
         num_workers=args.preprocessing_num_workers,
     )
     eval_dataloader = DataLoader(
         eval_dataset,
         collate_fn=data_collator,
-        batch_size=args.per_device_eval_batch_size,
+        batch_size=config.per_device_eval_batch_size,
         num_workers=args.preprocessing_num_workers,
     )
 
@@ -423,20 +465,20 @@ def main():
             "weight_decay": 0.0,
         },
     ]
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=config.learning_rate)
 
     # LR Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if args.max_train_steps is None:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+    if config.max_train_steps is None:
+        config.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
 
     lr_scheduler = get_scheduler(
         name=args.lr_scheduler_type,
         optimizer=optimizer,
         num_warmup_steps=args.num_warmup_steps * args.gradient_accumulation_steps,
-        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+        num_training_steps=config.max_train_steps * args.gradient_accumulation_steps,
     )
 
     # Prepare everything with our `accelerator`.
@@ -448,9 +490,9 @@ def main():
     # have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+        config.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     # Afterwards we recalculate our number of training epochs
-    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+    args.num_train_epochs = math.ceil(config.max_train_steps / num_update_steps_per_epoch)
 
     # Figure out how many steps we should save the Accelerator states
     checkpointing_steps = args.checkpointing_steps
@@ -460,14 +502,16 @@ def main():
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if args.with_tracking:
-        experiment_config = vars(args)
-        # TensorBoard cannot log Enums, need the raw value
-        experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
-        accelerator.init_trackers("tb_logs", experiment_config)
+        experiment_config = {**vars(args), **config.to_dict()}
+        # WandB hates logging Enums, need the raw value
+        for key in ["alpha", "attn_dropout", "block_size", "hidden_dropout", "max_seq_length", "max_train_steps", "model_name_or_path", "percentile", "resume_from_checkpoint", "lr_scheduler_type"]:
+            if key in experiment_config:
+                experiment_config[key] = experiment_config[key].value
+        accelerator.init_trackers(args.project_name, experiment_config)
 
     # Train!
     total_batch_size = (
-        args.per_device_train_batch_size
+        config.per_device_train_batch_size
         * accelerator.num_processes
         * args.gradient_accumulation_steps
     )
@@ -475,16 +519,16 @@ def main():
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
+    logger.info(f"  Instantaneous batch size per device = {config.per_device_train_batch_size}")
     logger.info(
         f"  Total train batch size (w. parallel, distributed & accumulation) = "
         f"{total_batch_size}"
     )
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    logger.info(f"  Total optimization steps = {config.max_train_steps}")
 
     # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
+    progress_bar = tqdm(range(config.max_train_steps), disable=not accelerator.is_local_main_process)
     completed_steps = 0
     starting_epoch = 0
 
@@ -667,7 +711,7 @@ def main():
                                     f"Could not log act histogram for {name} at step {completed_steps}"
                                 )
 
-            if completed_steps >= args.max_train_steps:
+            if completed_steps >= config.max_train_steps:
                 break
 
         # ** Evaluation **
@@ -678,7 +722,7 @@ def main():
                 outputs = model(**batch)
 
             loss = outputs.loss
-            loss_ = accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size))
+            loss_ = accelerator.gather_for_metrics(loss.repeat(config.per_device_eval_batch_size))
             losses.append(loss_)
 
         losses = torch.cat(losses)

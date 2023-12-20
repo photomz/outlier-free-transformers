@@ -109,10 +109,18 @@ def main():
     if args.with_tracking:
         accelerator_log_kwargs["log_with"] = args.report_to
         accelerator_log_kwargs["project_dir"] = args.output_dir
+        
         # MZ: Support WandB logging
-        accelerator_log_kwargs["run_name"] = args.config_name + datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
-        os.environ['WANDB_PROJECT'] = args.project_name
-        os.environ['WANDB_LOG_MODEL'] = 'checkpoint' # log all model checkpoints as WandB artifacts
+        if args.report_to == 'wandb':
+            import wandb
+            wandb_run_name = args.config_name + '-' + datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+            wandb.init(
+                project=args.project_name,
+                name=wandb_run_name,
+                resume=args.resume_from_checkpoint,
+                allow_val_change=True,
+            )
+            os.environ['WANDB_LOG_MODEL'] = 'checkpoint' # upload model artifacts
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps, **accelerator_log_kwargs
@@ -390,6 +398,7 @@ def main():
                 for k, t in concatenated_examples.items()
             }
             result["labels"] = result["input_ids"].copy()
+            result['count'] = total_length
             return result
 
         # Note that with `batched=True`, this map processes 1,000 texts together, so group_texts throws away a remainder
@@ -408,6 +417,13 @@ def main():
                 load_from_cache_file=not args.overwrite_cache,
                 desc=f"Grouping texts in chunks of {block_size}",
             )
+            
+        total_tokens = sum(sum(batch["token_count"]) for batch in tokenized_datasets)
+        accelerator.print(f"Total number of tokens in the dataset: {total_tokens}")
+            
+        if dataset_setup == DatasetSetups.bookcorpus_and_wiki:
+            # Save the tokenizer's hard work
+            tokenized_datasets.save_to_disk(str(tokenized_book_wiki_path))
 
         # <end elif: do tokenization>
 
@@ -430,13 +446,13 @@ def main():
         train_dataset,
         shuffle=True,
         collate_fn=default_data_collator,
-        batch_size=args.per_device_train_batch_size,
+        batch_size=config.per_device_train_batch_size,
         num_workers=args.preprocessing_num_workers,
     )
     eval_dataloader = DataLoader(
         eval_dataset,
         collate_fn=default_data_collator,
-        batch_size=args.per_device_eval_batch_size,
+        batch_size=config.per_device_eval_batch_size,
         num_workers=args.preprocessing_num_workers,
     )
 
@@ -463,17 +479,17 @@ def main():
         },
     ]
     optimizer = torch.optim.AdamW(
-        optimizer_grouped_parameters, lr=args.learning_rate, betas=(0.9, 0.95)
+        optimizer_grouped_parameters, lr=config.learning_rate, betas=(0.9, 0.95)
     )  # <- as per OPT paper
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if args.max_train_steps is None:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+    if config.max_train_steps is None:
+        config.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
 
-    w = args.num_warmup_steps / max(1.0, args.max_train_steps)
+    w = args.num_warmup_steps / max(1.0, config.max_train_steps)
     eps = args.final_lr_fraction
     a = 1 / (1 - (1.0 - w) * eps)
 
@@ -481,7 +497,7 @@ def main():
         name=args.lr_scheduler_type,
         optimizer=optimizer,
         num_warmup_steps=int(args.num_warmup_steps * a),
-        num_training_steps=int(args.max_train_steps * a),
+        num_training_steps=int(config.max_train_steps * a),
     )
 
     # Prepare everything with our `accelerator`.
@@ -492,9 +508,9 @@ def main():
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+        config.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     # Afterwards we recalculate our number of training epochs
-    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+    args.num_train_epochs = math.ceil(config.max_train_steps / num_update_steps_per_epoch)
 
     # Figure out how many steps we should save the Accelerator states
     checkpointing_steps = args.checkpointing_steps
@@ -507,11 +523,11 @@ def main():
         experiment_config = vars(args)
         # TensorBoard cannot log Enums, need the raw value
         experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
-        accelerator.init_trackers("tb_logs", experiment_config)
+        accelerator.init_trackers(args.project_name, experiment_config)
 
     # Train!
     total_batch_size = (
-        args.per_device_train_batch_size
+        config.per_device_train_batch_size
         * accelerator.num_processes
         * args.gradient_accumulation_steps
     )
@@ -519,14 +535,14 @@ def main():
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
+    logger.info(f"  Instantaneous batch size per device = {config.per_device_train_batch_size}")
     logger.info(
         f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}"
     )
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    logger.info(f"  Total optimization steps = {config.max_train_steps}")
     # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
+    progress_bar = tqdm(range(config.max_train_steps), disable=not accelerator.is_local_main_process)
     completed_steps = 0
     starting_epoch = 0
 
@@ -658,44 +674,44 @@ def main():
                         x_inf_norm = max(x.max().item(), -x.min().item())
                         accelerator.log({f"{name}.act_inf_norm": x_inf_norm}, step=completed_steps)
 
-                # TB log histograms
-                if (
-                    args.with_tracking
-                    and accelerator.is_main_process
-                    and args.extra_tb_stats
-                    and completed_steps % args.tb_hist_log_interval == 0
-                ):
-                    tb_writer = accelerator.trackers[0].writer
+                # # TB log histograms
+                # if (
+                #     args.with_tracking
+                #     and accelerator.is_main_process
+                #     and args.extra_tb_stats
+                #     and completed_steps % args.tb_hist_log_interval == 0
+                # ):
+                #     tb_writer = accelerator.trackers[0].writer
 
-                    # weight histograms
-                    for name, module in model.named_modules():
-                        if hasattr(module, "weight"):
-                            w = module.weight
-                            try:
-                                with warnings.catch_warnings():
-                                    warnings.filterwarnings("ignore", category=DeprecationWarning)
-                                    tb_writer.add_histogram(
-                                        f"{name}.weight_hist", w, global_step=completed_steps
-                                    )
-                            except:
-                                logger.warn(
-                                    f"Could not log weight histogram for {name} at step {completed_steps}"
-                                )
+                #     # weight histograms
+                #     for name, module in model.named_modules():
+                #         if hasattr(module, "weight"):
+                #             w = module.weight
+                #             try:
+                #                 with warnings.catch_warnings():
+                #                     warnings.filterwarnings("ignore", category=DeprecationWarning)
+                #                     tb_writer.add_histogram(
+                #                         f"{name}.weight_hist", w, global_step=completed_steps
+                #                     )
+                #             except:
+                #                 logger.warn(
+                #                     f"Could not log weight histogram for {name} at step {completed_steps}"
+                #                 )
 
-                    # act histograms
-                    for name, x in act_dict.items():
-                        try:
-                            with warnings.catch_warnings():
-                                warnings.filterwarnings("ignore", category=DeprecationWarning)
-                                tb_writer.add_histogram(
-                                    f"{name}.act_hist", x, global_step=completed_steps
-                                )
-                        except:
-                            logger.warn(
-                                f"Could not log act histogram for {name} at step {completed_steps}"
-                            )
+                #     # act histograms
+                #     for name, x in act_dict.items():
+                #         try:
+                #             with warnings.catch_warnings():
+                #                 warnings.filterwarnings("ignore", category=DeprecationWarning)
+                #                 tb_writer.add_histogram(
+                #                     f"{name}.act_hist", x, global_step=completed_steps
+                #                 )
+                #         except:
+                #             logger.warn(
+                #                 f"Could not log act histogram for {name} at step {completed_steps}"
+                #             )
 
-            if completed_steps >= args.max_train_steps:
+            if completed_steps >= config.max_train_steps:
                 break
 
         # ---------------------------------
@@ -722,7 +738,7 @@ def main():
                 outputs = model(**batch)
 
             loss = outputs.loss
-            loss_ = accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size))
+            loss_ = accelerator.gather_for_metrics(loss.repeat(config.per_device_eval_batch_size))
             losses.append(loss_)
 
             # compute inf norms & kurtosis (>>>)

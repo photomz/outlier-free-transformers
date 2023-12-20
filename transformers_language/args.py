@@ -1,7 +1,6 @@
 # Copyright (c) 2023 Qualcomm Technologies, Inc.
 # All Rights Reserved.
 import argparse
-
 from transformers import MODEL_MAPPING, SchedulerType
 
 from transformers_language.dataset_setups import DatasetSetups
@@ -66,7 +65,7 @@ def parse_args():
     )
     parser.add_argument(
         "--use_slow_tokenizer",
-        action="store_true",
+        action="store_false",
         help="If passed, will use a slow tokenizer (not backed by the 🤗 Tokenizers library).",
     )
     parser.add_argument(
@@ -211,6 +210,13 @@ def parse_args():
             "It is an option to create the model as an empty shell, then only materialize its parameters when the pretrained weights are loaded."
             "If passed, LLM loading time and RAM consumption will be benefited."
         ),
+    )
+    
+    parser.add_argument(
+        "--run_name",
+        type=str,
+        default="rokos-basilisk",
+        help = "Run name for experiment tracking, i.e. WandB",
     )
 
     # *** New options ***

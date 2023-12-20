@@ -77,9 +77,17 @@ def main():
     if args.with_tracking:
         accelerator_log_kwargs["log_with"] = args.report_to
         accelerator_log_kwargs["logging_dir"] = args.output_dir
+        
         # MZ: Support WandB logging
-        accelerator_log_kwargs["run_name"] = args.config_name + datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
-        os.environ['WANDB_PROJECT'] = args.project_name
+        if args.report_to == 'wandb':
+            import wandb
+            wandb_run_name = args.config_name + '-' + datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+            wandb.init(
+                project=args.project_name,
+                name=wandb_run_name,
+                resume=args.resume_from_checkpoint,
+                allow_val_change=True,
+            )
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps, **accelerator_log_kwargs
@@ -397,13 +405,13 @@ def main():
         train_dataset,
         shuffle=True,
         collate_fn=default_data_collator,
-        batch_size=args.per_device_train_batch_size,
+        batch_size=config.per_device_train_batch_size,
         num_workers=args.preprocessing_num_workers,
     )
     eval_dataloader = DataLoader(
         eval_dataset,
         collate_fn=default_data_collator,
-        batch_size=args.per_device_eval_batch_size,
+        batch_size=config.per_device_eval_batch_size,
         num_workers=args.preprocessing_num_workers,
     )
 
@@ -542,7 +550,7 @@ def main():
             outputs = model(**batch)
 
         loss = outputs.loss
-        loss_ = accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size))
+        loss_ = accelerator.gather_for_metrics(loss.repeat(config.per_device_eval_batch_size))
         losses.append(loss_)
 
         # compute inf norms
